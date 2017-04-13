@@ -188,7 +188,11 @@ func startProcess(id, body string, dest chan<- *Message, opt *Options) *process 
 			err = errors.New("script execution is not allowed")
 		}
 	} else {
-		err = p.start(body, opt)
+		if lang, args := shequestion(body); lang != "" {
+			err = p.startLang(body, lang, args)
+		} else {
+			err = p.start(body, opt)
+		}
 	}
 	if err != nil {
 		p.end(err)
@@ -330,6 +334,21 @@ func shebang(body string) (path string, args []string) {
 	return fs[0], fs
 }
 
+// shequestion looks for a ('#?') at the beginning of the passed string.
+// If found, it returns the language and args after the shequestion.
+// For example, java Main, where Main is the class name.
+func shequestion(body string) (lang string, args []string) {
+	body = strings.TrimSpace(body)
+	if !strings.HasPrefix(body, "#?") {
+		return "", nil
+	}
+	if i := strings.Index(body, "\n"); i >= 0 {
+		body = body[:i]
+	}
+	fs := strings.Fields(body[2:])
+	return fs[0], fs[1:]
+}
+
 // startProcess starts a given program given its path and passing the given body
 // to the command standard input.
 func (p *process) startProcess(path string, args []string, body string) error {
@@ -340,6 +359,57 @@ func (p *process) startProcess(path string, args []string, body string) error {
 		Stdout: &messageWriter{kind: "stdout", out: p.out},
 		Stderr: &messageWriter{kind: "stderr", out: p.out},
 	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	p.run = cmd
+	return nil
+}
+
+// start builds and starts the given program for the given language, sending
+// its output to p.out, and stores the running *exec.Cmd in the run field.
+func (p *process) startLang(body, lang string, args []string) error {
+	// strip language tag and arguments
+	body = strings.TrimSpace(body)
+	if i := strings.Index(body, "\n"); i >= 0 {
+		body = body[i+1:]
+	}
+	switch lang {
+	case "java":
+		return p.java(body, args)
+	}
+	return nil
+}
+
+// start builds and starts the java program, sending its output
+// to p.out, and stores the running *exec.Cmd in the run field.
+// Assumes java is in os Path
+func (p *process) java(body string, args []string) error {
+	if len(args) == 0 || args[0] == "" {
+		return errors.New("java args: no class name specified")
+	}
+	bin := filepath.Join(tmpdir, args[0])
+	src := bin + ".java"
+
+	// write body from 1st line to x.java
+	defer os.Remove(src)
+	err := ioutil.WriteFile(src, []byte(body), 0666)
+	if err != nil {
+		return err
+	}
+
+	// build x.java, creating x.class (call javac)
+	p.bin = bin // to be removed by p.end
+	dir, file := filepath.Split(src)
+
+	cmd := p.cmd(dir, "javac", file)
+	cmd.Stdout = cmd.Stderr // send compiler output to stderr
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	// run x
+	cmd = p.cmd(dir, "java", args[0])
 	if err := cmd.Start(); err != nil {
 		return err
 	}
